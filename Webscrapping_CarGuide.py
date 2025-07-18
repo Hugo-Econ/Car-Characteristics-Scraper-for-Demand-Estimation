@@ -8,33 +8,11 @@ demand estimation.
 import os
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup # Webscrapping  
 import time
 import pprint
 import sqlite3
-
-ev_makers = [
-    "Acura", "Alfa Romeo", "Allard", "Aston Martin", "Audi",
-    "Bentley", "BMW", "Bugatti", "Buick", "Byd",
-    "Cadillac", "Campagna Motors", "Chevrolet", "Chrysler",
-    "Dodge",
-    "Faraday Future", "Felino", "Ferrari", "Fiat", "Fisker", "Ford",
-    "Genesis", "GMC",
-    "Honda", "Hummer", "Hyundai",
-    "Ineos", "Infiniti", "Isuzu",
-    "Jaguar", "Jeep",
-    "Karma", "Kia", "Koenigsegg",
-    "Lamborghini", "Lancia", "Land Rover", "Lexus", "Lincoln", "Liteborne", "Lotus", "Lucid",
-    "Maserati", "Maybach", "Mazda", "McLaren", "Mercedes-Benz", "Mercury", "MINI", "Mitsubishi",
-    "Nissan",
-    "Oldsmobile", "Opel",
-    "Pagani", "Panoz", "Peugeot", "Polestar", "Pontiac", "Porsche",
-    "Ram", "Renault", "Rimac", "Rivian", "Rolls-Royce",
-    "Saab", "Saleen", "Saturn", "Scion", "smart", "Spyker", "SRT", "Subaru", "Suzuki",
-    "Tata", "Tesla", "Toyota",
-    "VinFast", "Volkswagen", "Volvo"
-]
-
+from concurrent.futures import ThreadPoolExecutor, as_completed # Parallelizing  
 BASE_URL = "https://www.guideautoweb.com"
 MAKE_LIST_URL = f"{BASE_URL}/en/makes/"
 
@@ -50,33 +28,48 @@ make_links = {
 }
 
 # Step 2: For each make, extract production model names
-make_to_models = {}
-
-for make, url in make_links.items():
+def fetch_models_for_make(make, url):
     print(f"🔍 Fetching models for: {make}")
     try:
         r = requests.get(url)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Find the model names under the "Production models" section
+        # --- Extract Production models ---
         model_tags = soup.select('div.s h2.st:contains("Production models") + ul li a.e-a.e-t')
         if not model_tags:  # fallback if the above doesn't work
             model_tags = soup.select('ul.eg.eg-t1 li a.e-a.e-t')
 
-        model_names = sorted(set(tag.text.strip().replace(f"{make} ", "") for tag in model_tags))
-        if model_names:
-            make_to_models[make] = model_names
-            print(f"  ✅ Found {len(model_names)} models.")
+        model_names = set(tag.text.strip().replace(f"{make} ", "") for tag in model_tags)
+
+        # --- Extract Other models ---
+        other_model_tags = soup.select('div.s h2.st:contains("Other models") + ul li a.txt')
+        other_model_names = set(tag.text.strip().replace(f"{make} ", "") for tag in other_model_tags)
+
+        all_models = sorted(model_names.union(other_model_names))
+
+        if all_models:
+            print(f"  ✅ Found {len(all_models)} models for {make}.")
+            return (make, all_models)
         else:
-            print(f"  ⚠️ No models found.")
-        time.sleep(1)
+            print(f"  ⚠️ No models found for {make}.")
+            return (make, [])
     except Exception as e:
         print(f"  ❌ Failed to process {make}: {e}")
+        return (make, [])
 
-# Preview result
+# 🚀 Run in parallel
+make_to_models = {}
+with ThreadPoolExecutor(max_workers=20) as executor:
+    futures = [executor.submit(fetch_models_for_make, make, url) for make, url in make_links.items()]
+    for future in as_completed(futures):
+        make, models = future.result()
+        if models:
+            make_to_models[make] = models
+        time.sleep(0.2)  # Light delay between completed futures to throttle output
+
+# ✅ Preview result
 for k, v in list(make_to_models.items())[:5]:
     print(f"\n{k}: {v}")
-    
  
     
 
@@ -90,7 +83,7 @@ def get_text_or_none(soup, label):
     return None
 
 def parse_spec_page(url, year, trim):
-    print(f"🔍 Parsing: {year} - {trim}")
+    # print(f"🔍 Parsing: {year} - {trim}")
     r = requests.get(url)
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -100,11 +93,15 @@ def parse_spec_page(url, year, trim):
         "MSRP": get_text_or_none(soup, "MSRP"),
         "Engine": get_text_or_none(soup, "Engine"),
         "Power": get_text_or_none(soup, "Power"),
-        "Torque": get_text_or_none(soup, "Torque"),
+        #"Torque": get_text_or_none(soup, "Torque"),
         "Fuel_Cost": 0 if get_text_or_none(soup, "Engine") == "Electric" else get_text_or_none(soup, "Combined"),
-        "Vehicle Type": get_text_or_none(soup, "Vehicle type"),
+        "Vehicle_Type": get_text_or_none(soup, "Vehicle type"),
         "Category": get_text_or_none(soup, "Category"),
         "Weight": get_text_or_none(soup, "Weight"),
+        "Charging_time": get_text_or_none(soup, "Charging times"),
+        "Range": get_text_or_none(soup, "Electric autonomy"),
+        "Battery": get_text_or_none(soup, "Energy"),
+        "Co2_km": get_text_or_none(soup, "CO₂ emissions"),
         "URL": url
     }
 
@@ -121,18 +118,26 @@ def get_trim_urls_from_spec_page(spec_page_url):
             trims[trim_name] = full_url
     return trims
 
-brand_dataframes = {}
-save_dir = r"C:\Users\Hugo\Dropbox\1. School\1.Research\Optimal spatial fast charging policies\Data\clean\CarGuide"
-os.makedirs(save_dir, exist_ok=True)
 
-for make, models in make_to_models.items():
+# %% Get maker-model-year-spec AND their key characteristic 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+
+# Make sure these helper functions are defined beforehand:
+# get_trim_urls_from_spec_page(...)
+# parse_spec_page(...)
+
+def process_make(make, models):
     print(f"\n🚗 Processing brand: {make}")
     all_specs = []
-    
+
     for model in models:
         model_slug = model.lower().replace(" ", "-")
-        start_url = f"{BASE_URL}/en/makes/{make.lower()}/{model_slug}/2025/"
-        
+        start_url = f"{BASE_URL}/en/makes/{make.lower()}/{model_slug}/"
+
         try:
             r = requests.get(start_url)
             soup = BeautifulSoup(r.text, "html.parser")
@@ -168,7 +173,7 @@ for make, models in make_to_models.items():
                             spec_data["Make"] = make
                             spec_data["Model"] = model
                             all_specs.append(spec_data)
-                            time.sleep(0.4)
+                            time.sleep(0.4)  # Still important to respect rate limits
                         except Exception as e:
                             print(f"❌ Error trim: {trim} → {e}")
                 except Exception as e:
@@ -176,17 +181,31 @@ for make, models in make_to_models.items():
         except Exception as e:
             print(f"❌ Could not process {make} {model}: {e}")
 
-    # Add to brand dictionary if any data collected
     if all_specs:
-        brand_df = pd.DataFrame(all_specs)
-        brand_dataframes[make] = brand_df
-        print(f"✅ Finished {make} with {len(brand_df)} rows.")
+        df = pd.DataFrame(all_specs)
+        print(f"✅ Finished {make} with {len(df)} rows.")
+        return make, df
     else:
         print(f"⚠️ No data collected for {make}.")
+        return make, None
 
-# ✅ Done!
+brand_dataframes = {}
+# subset_20 = dict(list(make_to_models.items())[:15])
+
+with ThreadPoolExecutor(max_workers=18) as executor:  # You can adjust 5 to 10–20 if your machine can handle it
+    futures = [executor.submit(process_make, make, models) for make, models in make_to_models.items()]
+    
+    for future in as_completed(futures):
+        make, df = future.result()
+        if df is not None:
+            brand_dataframes[make] = df
+
 print("\n✅ All brands processed. Previewing one:")
-print(brand_dataframes['Nissan'].head().T)
+if 'Nissan' in brand_dataframes:
+    print(brand_dataframes['Nissan'].head().T)
+
+df_chevy = brand_dataframes.get('Chevrolet')
+
 
 # %% Save to SQLite under a single table
 save_dir = r"C:\Users\Hugo\Dropbox\1. School\1.Research\Optimal spatial fast charging policies\Data\clean\CarGuide"
@@ -223,6 +242,9 @@ WHERE LOWER(Engine) LIKE '%electric%'
 
 df_electric = pd.read_sql(query, conn)
 df_electric.columns
+df_electric['Model'].unique()
+test = df_electric[df_electric['Model']=="Bolt EV"]
 print(df_electric.head())
 
 conn.close()
+
